@@ -104,6 +104,8 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        
+        self.norm1 = LayerNorm(cfg["emb_dim"])
 
         self.att = MultiHeadAttention(
             d_in=cfg["emb_dim"],
@@ -114,10 +116,9 @@ class TransformerBlock(nn.Module):
             qkv_bias=cfg["qkv_bias"]
         )
 
-        self.ff = FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg["emb_dim"])
-        self.norm2 = LayerNorm(cfg["emb_dim"])
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.ff = FeedForward(cfg)
 
     def forward(self, x):
         # Shortcut connection for attention block
@@ -184,6 +185,44 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
     return idx
 
 
+def generate(model, idx, max_new_tokens, context_size, temperature=1.0, top_k=None, eos_id=None):
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cond)
+        
+        logits = logits[:, -1, :]  # Focus on last time step
+
+        # Filter logits with top-k sampling
+        if top_k is not None:
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+
+            logits = torch.where(
+                logits < min_val,
+                torch.tensor(float("-inf")).to(logits.device),
+                logits
+            )
+    
+        # Apply temperature scaling
+        if temperature > 0.0:
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+        # Greedy next-token selection
+        else:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        
+        # Stop generating if EOS token is specified and encountered
+        if idx_next == eos_id:
+            break
+        
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+
+
 class GPTDatasetV1(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
         self.input_ids = []
@@ -223,3 +262,117 @@ def create_dataloader_v1(
         drop_last=drop_last,
         num_workers=num_workers,
     )
+
+
+def calc_loss_batch(input_batch, target_batch, model, device):
+    # The transfer to a given device allows us to transfer the data to a GPU
+    input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+    logits = model(input_batch)
+    loss = torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1), target_batch.flatten()
+    )
+    
+    return loss
+
+
+def calc_loss_loader(data_loader, model, device, num_batches=None):
+    total_loss = 0.0
+
+    if len(data_loader) == 0:
+        return float("nan")
+    elif num_batches is None:
+        num_batches = len(data_loader)  # Iterate over all batches if not specified
+    else:
+        num_batches = min(num_batches, len(data_loader))
+    
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i < num_batches:
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            total_loss += loss.item()
+        else:
+            break
+    
+    return total_loss / num_batches  # Average the loss over all batches
+
+
+def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+    model.eval()  # Dropout is disabled during evaluation for stable, reproducible results
+
+    # Disable gradient tracking, which isn't required during evaluation, to reduce computational overhead
+    with torch.no_grad():
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+    
+    model.train()  # Switch model to training mode
+
+    return train_loss, val_loss
+
+
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(text, allowed_special={'<|endoftext|>'})
+    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # Add batch dimension: (1, n_tokens)
+    return encoded_tensor
+
+
+def token_ids_to_text(token_ids, tokenizer):
+    flat = token_ids.squeeze(0)  # Remove batch dimension
+    return tokenizer.decode(flat.tolist())
+
+
+def generate_and_print_sample(model, tokenizer, device, start_context):
+    model.eval()  # Switch model to evaluation mode
+    
+    context_size = model.pos_emb.weight.shape[0]
+    encoded = text_to_token_ids(start_context, tokenizer).to(device)
+
+    with torch.no_grad():
+        token_ids = generate_text_simple(
+            model=model, idx=encoded, max_new_tokens=50, context_size=context_size
+        )
+
+        decoded_text = token_ids_to_text(token_ids, tokenizer)
+        print(decoded_text.replace("\n", " "))  # Compact print format
+    
+    model.train()  # Switch model to training mode
+
+
+def train_model_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_freq,
+    eval_iter,
+    start_context,
+    tokenizer,
+):
+    train_losses, val_losses, track_tokens_seen = [], [], []
+    tokens_seen, global_step = 0, -1
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss.backward()  # Calculate loss gradients
+            optimizer.step()  # Update model weights using loss gradients
+            tokens_seen += input_batch.numel()
+            global_step += 1
+
+            # Optional evaluation step
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model(
+                    model, train_loader, val_loader, device, eval_iter
+                )
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens_seen.append(tokens_seen)
+                print(f"Epoch {epoch + 1} (Step {global_step:06d}): Train loss {train_loss:.3f}, Validation loss {val_loss:.3f}")
+        
+        # Print a sample text after each epoch
+        generate_and_print_sample(model, tokenizer, device, start_context)
+
+    return train_losses, val_losses, track_tokens_seen
