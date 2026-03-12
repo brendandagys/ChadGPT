@@ -1,3 +1,4 @@
+import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
@@ -275,7 +276,15 @@ def calc_loss_batch(input_batch, target_batch, model, device):
     return loss
 
 
-def calc_loss_loader(data_loader, model, device, num_batches=None):
+def calc_loss_batch_last_token(input_batch, target_batch, model, device):
+    input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+    logits = model(input_batch)[:, -1, :]  # Logits of last output token
+    loss = torch.nn.functional.cross_entropy(logits, target_batch)
+
+    return loss
+
+
+def calc_loss_loader(data_loader, model, device, num_batches=None, last_token=False):
     total_loss = 0.0
 
     if len(data_loader) == 0:
@@ -287,7 +296,7 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
     
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i < num_batches:
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss = (calc_loss_batch_last_token if last_token else calc_loss_batch)(input_batch, target_batch, model, device)
             total_loss += loss.item()
         else:
             break
@@ -295,13 +304,39 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
     return total_loss / num_batches  # Average the loss over all batches
 
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+def calc_accuracy_loader(data_loader, model, device, num_batches=None):
+    model.eval()
+    correct_predictions, num_examples = 0, 0
+
+    num_batches = min(
+        float('inf') if num_batches is None else num_batches,
+        len(data_loader)
+    )
+
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i < num_batches:
+            input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+
+            with torch.no_grad():
+                logits = model(input_batch)[:, -1, :]  # Logits of last output token
+
+            predicted_labels = torch.argmax(logits, dim=-1)
+            num_examples += predicted_labels.shape[0]
+            # Creates a boolean tensor
+            correct_predictions += (predicted_labels == target_batch).sum().item()
+        else:
+            break
+
+    return correct_predictions / num_examples
+
+
+def evaluate_model(model, train_loader, val_loader, device, eval_iter, last_token=False):
     model.eval()  # Dropout is disabled during evaluation for stable, reproducible results
 
     # Disable gradient tracking, which isn't required during evaluation, to reduce computational overhead
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter, last_token=last_token)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter, last_token=last_token)
     
     model.train()  # Switch model to training mode
 
@@ -376,3 +411,69 @@ def train_model_simple(
         generate_and_print_sample(model, tokenizer, device, start_context)
 
     return train_losses, val_losses, track_tokens_seen
+
+
+def assign(left, right):
+    if left.shape != right.shape:
+        raise ValueError(f"Shape mismatch: {left.shape} vs. {right.shape}")
+
+    return torch.nn.Parameter(torch.tensor(right))
+
+
+def load_weights_into_gpt(gpt, params):
+    gpt.tok_emb.weight = assign(gpt.tok_emb.weight, params['wte'])
+    gpt.pos_emb.weight = assign(gpt.pos_emb.weight, params['wpe'])
+
+    # Iterate over all transformer blocks in the model, assign corresponding weights and biases
+    for b in range(len(params["blocks"])):
+        # LAYER NORMALIZATIONS IN TRANSFORMER
+        gpt.trf_blocks[b].norm1.scale = assign(
+            gpt.trf_blocks[b].norm1.scale, params["blocks"][b]["ln_1"]["g"])
+        gpt.trf_blocks[b].norm1.shift = assign(
+            gpt.trf_blocks[b].norm1.shift, params["blocks"][b]["ln_1"]["b"])
+        gpt.trf_blocks[b].norm2.scale = assign(
+            gpt.trf_blocks[b].norm2.scale, params["blocks"][b]["ln_2"]["g"])
+        gpt.trf_blocks[b].norm2.shift = assign(
+            gpt.trf_blocks[b].norm2.shift, params["blocks"][b]["ln_2"]["b"])
+
+        # MASKED MULTI-HEAD ATTENTION
+        # Split the attention weights into 3 equal parts for the query, key, and value components
+        q_w, k_w, v_w = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["w"], 3, axis=-1)
+        # Split the bias weights into 3 equal parts for the query, key, and value components
+        q_b, k_b, v_b = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["b"], 3, axis=-1)
+        
+        gpt.trf_blocks[b].att.W_query.weight = assign(gpt.trf_blocks[b].att.W_query.weight, q_w.T)
+        gpt.trf_blocks[b].att.W_key.weight = assign(gpt.trf_blocks[b].att.W_key.weight, k_w.T)
+        gpt.trf_blocks[b].att.W_value.weight = assign(gpt.trf_blocks[b].att.W_value.weight, v_w.T)
+
+        gpt.trf_blocks[b].att.W_query.bias = assign(gpt.trf_blocks[b].att.W_query.bias, q_b)
+        gpt.trf_blocks[b].att.W_key.bias = assign(gpt.trf_blocks[b].att.W_key.bias, k_b)
+        gpt.trf_blocks[b].att.W_value.bias = assign(gpt.trf_blocks[b].att.W_value.bias, v_b)
+
+        # Weight and bias tensors for the output projection layer, that map the
+        # concatenated outputs of the attention heads back to the embedding dimension
+        gpt.trf_blocks[b].att.out_proj.weight = assign(
+            gpt.trf_blocks[b].att.out_proj.weight, params["blocks"][b]["attn"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].att.out_proj.bias = assign(
+            gpt.trf_blocks[b].att.out_proj.bias, params["blocks"][b]["attn"]["c_proj"]["b"])
+
+        # FEED-FORWARD NETWORK
+        # Weight and bias tensors for the feed-forward network layers in the transformer block
+        gpt.trf_blocks[b].ff.layers[0].weight = assign(  # causal_fully-connected (expands 4x emb_dim)
+            gpt.trf_blocks[b].ff.layers[0].weight, params["blocks"][b]["mlp"]["c_fc"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[0].bias = assign(
+            gpt.trf_blocks[b].ff.layers[0].bias, params["blocks"][b]["mlp"]["c_fc"]["b"])
+        gpt.trf_blocks[b].ff.layers[2].weight = assign(  # causal_projection (contracts back to emb_dim)
+            gpt.trf_blocks[b].ff.layers[2].weight, params["blocks"][b]["mlp"]["c_proj"]["w"].T)
+        gpt.trf_blocks[b].ff.layers[2].bias = assign(
+            gpt.trf_blocks[b].ff.layers[2].bias, params["blocks"][b]["mlp"]["c_proj"]["b"])
+
+    # FINAL LAYER NORMALIZATION before the output projection
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+
+    # The original GPT-2 model reused the token embedding weights in the output layer
+    # to reduce the total number of parameters, a concept known as weight tying
+    gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
