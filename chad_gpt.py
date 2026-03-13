@@ -1,9 +1,10 @@
+
 import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
-
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False):
@@ -477,3 +478,17 @@ def load_weights_into_gpt(gpt, params):
     # The original GPT-2 model reused the token embedding weights in the output layer
     # to reduce the total number of parameters, a concept known as weight tying
     gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
+
+
+def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
+    fig, ax1 = plt.subplots(figsize=(5, 3))
+    ax1.plot(epochs_seen, train_losses, label="Training loss")
+    ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
+    ax1.set_xlabel("Epochs seen")
+    ax1.set_ylabel("Loss")
+    ax1.legend(loc="upper right")
+    ax2 = ax1.twiny()  # Create a second x-axis that shares the same y-axis
+    ax2.plot(tokens_seen, train_losses, alpha=0)  # Invisible plot for aligning ticks
+    ax2.set_xlabel("Tokens seen")
+    fig.tight_layout()
+    plt.show()
